@@ -22,6 +22,8 @@ import json
 import re
 import contextlib
 import tempfile
+import shutil
+from pathlib import Path
 
 try:
     import configpbi
@@ -37,6 +39,11 @@ try:
 except ImportError:
     print("nodriver não encontrado. Instale com: pip install nodriver")
     sys.exit(1)
+
+try:
+    import config_templates
+except ModuleNotFoundError:
+    config_templates = None
 
 # ---------------------------------------------------------------------------
 # Configuração de logging
@@ -152,6 +159,10 @@ FILTER_PLAN: dict = {
         "required": True,
     },
 }
+
+OUTPUT_BASE_DIR = "output"
+DOWNLOAD_ALLOWED_EXTENSIONS = {".xlsx", ".csv", ".txt", ".tsv", ".zip"}
+DOWNLOAD_TEMP_EXTENSIONS = {".crdownload", ".tmp", ".part"}
 
 # ---------------------------------------------------------------------------
 # Funções auxiliares
@@ -3867,6 +3878,209 @@ def normalize_slicer_name(display_name: str) -> str:
     return normalized
 
 
+def normalize_filter_key(raw_key: str) -> str:
+    """Normaliza chave técnica de filtro para comparação estável."""
+    return str(raw_key or "").strip().lower()
+
+
+def load_templates_config():
+    """Carrega CATALOG e TEMPLATES do arquivo de configuração único."""
+    if config_templates is None:
+        log.info("[TEMPLATE_LOAD] templates_count=0 pages=[] source=config_templates.py_not_found")
+        return {}, []
+
+    catalog = getattr(config_templates, "CATALOG", {}) or {}
+    templates = getattr(config_templates, "TEMPLATES", []) or []
+
+    pages = sorted({str(t.get("page", "")) for t in templates if isinstance(t, dict)})
+    log.info(f"[TEMPLATE_LOAD] templates_count={len(templates)} pages={pages}")
+    return catalog, templates
+
+
+def validate_template(template: dict, catalog: dict) -> tuple[bool, list[str], dict]:
+    """
+    Valida template sem derrubar o lote inteiro.
+    Também normaliza as chaves técnicas para runtime.
+    """
+    errors = []
+    normalized = {}
+
+    template_id = str(template.get("template_id") or "").strip()
+    page = template.get("page")
+    filters = template.get("filters")
+
+    if not isinstance(page, str) or not page.strip():
+        errors.append("page deve ser string não vazia")
+
+    if not isinstance(filters, dict):
+        errors.append("filters deve ser dict")
+        filters = {}
+
+    if isinstance(page, str) and page.strip():
+        if page not in catalog:
+            errors.append(f"page '{page}' não está no CATALOG")
+
+    page_catalog = catalog.get(page, {}) if isinstance(page, str) else {}
+    catalog_filters = page_catalog.get("filters", {}) if isinstance(page_catalog, dict) else {}
+    catalog_keys_map = {normalize_filter_key(k): k for k in catalog_filters.keys()}
+
+    normalized_filters = {}
+    for raw_key, raw_value in filters.items():
+        if not isinstance(raw_value, str):
+            errors.append(f"filtro '{raw_key}' deve ter valor string")
+            continue
+
+        norm_key = normalize_filter_key(raw_key)
+        if not norm_key:
+            errors.append("chave de filtro vazia")
+            continue
+
+        if norm_key not in catalog_keys_map:
+            errors.append(f"filtro '{raw_key}' não permitido para page '{page}'")
+            continue
+
+        canonical_key = catalog_keys_map[norm_key]
+        allowed_values = catalog_filters.get(canonical_key, {}).get("values", [])
+        if raw_value not in allowed_values:
+            errors.append(
+                f"valor '{raw_value}' inválido para filtro '{canonical_key}' "
+                f"(permitidos={allowed_values})"
+            )
+            continue
+
+        normalized_filters[canonical_key] = raw_value
+
+    normalized = {
+        "template_id": template_id or "template_sem_id",
+        "page": page,
+        "filters": normalized_filters,
+    }
+    return len(errors) == 0, errors, normalized
+
+
+def build_runtime_filter_plan(template: dict) -> dict:
+    """Converte template validado para FILTER_PLAN runtime (single-select)."""
+    runtime = {}
+    for filter_key, filter_value in (template.get("filters") or {}).items():
+        runtime[normalize_filter_key(filter_key)] = {
+            "mode": "single",
+            "clear_first": True,
+            "target_values": [str(filter_value)],
+            "required": True,
+        }
+    return runtime
+
+
+def sanitize_template_token(value: str) -> str:
+    token = str(value or "").strip()
+    token = re.sub(r"[^a-zA-Z0-9._-]+", "_", token)
+    token = re.sub(r"_+", "_", token).strip("_")
+    return token or "na"
+
+
+def build_template_code(template: dict) -> str:
+    """
+    Gera código estável do template.
+    Ex.: COMPARATIVO__entrante-1__epn_final-ALMAVIVA
+    """
+    page = sanitize_template_token(template.get("page", "SEM_PAGINA"))
+    parts = [page]
+    for key in sorted((template.get("filters") or {}).keys()):
+        value = template["filters"][key]
+        parts.append(f"{sanitize_template_token(key)}-{sanitize_template_token(value)}")
+    return "__".join(parts)
+
+
+def prepare_output_folder(template_id: str, template_code: str) -> str:
+    """Recria pasta de output isolada para o template atual."""
+    output_folder = os.path.join(OUTPUT_BASE_DIR, template_code)
+    previous_removed = os.path.exists(output_folder)
+    if previous_removed:
+        shutil.rmtree(output_folder, ignore_errors=True)
+    os.makedirs(output_folder, exist_ok=True)
+    log.info(
+        f"[OUTPUT_FOLDER_PREPARE] template_id={template_id} output_folder={output_folder} "
+        f"folder_recreated=True previous_contents_removed={previous_removed}"
+    )
+    return output_folder
+
+
+def get_downloads_folder() -> str:
+    return str(Path.home() / "Downloads")
+
+
+def is_relevant_download_file(filename: str) -> bool:
+    lower_name = filename.lower()
+    _, ext = os.path.splitext(lower_name)
+    if ext in DOWNLOAD_TEMP_EXTENSIONS:
+        return False
+    return ext in DOWNLOAD_ALLOWED_EXTENSIONS
+
+
+def cleanup_residual_downloads(downloads_folder: str, template_id: str) -> list[str]:
+    """Limpeza controlada de resíduos do processo antes de cada template."""
+    removed = []
+    if not os.path.isdir(downloads_folder):
+        return removed
+
+    for filename in os.listdir(downloads_folder):
+        fullpath = os.path.join(downloads_folder, filename)
+        if not os.path.isfile(fullpath):
+            continue
+        if not is_relevant_download_file(filename):
+            continue
+        try:
+            os.remove(fullpath)
+            removed.append(filename)
+        except Exception:
+            continue
+
+    log.info(
+        f"[DOWNLOADS_CLEANUP_BEFORE_TEMPLATE] template_id={template_id} "
+        f"files_removed={removed} removed_count={len(removed)}"
+    )
+    return removed
+
+
+def snapshot_downloads(downloads_folder: str) -> set[str]:
+    if not os.path.isdir(downloads_folder):
+        return set()
+    return {
+        name for name in os.listdir(downloads_folder)
+        if os.path.isfile(os.path.join(downloads_folder, name))
+    }
+
+
+def capture_and_move_new_downloads(
+    template_id: str,
+    downloads_folder: str,
+    before_files: set[str],
+    output_folder: str,
+) -> list[str]:
+    """Detecta arquivos novos reais e move para a pasta do template."""
+    after_files = snapshot_downloads(downloads_folder)
+    new_files = sorted(after_files - before_files)
+    relevant = [f for f in new_files if is_relevant_download_file(f)]
+
+    moved = []
+    for filename in relevant:
+        src = os.path.join(downloads_folder, filename)
+        dst = os.path.join(output_folder, filename)
+        if not os.path.isfile(src):
+            continue
+        try:
+            shutil.move(src, dst)
+            moved.append(filename)
+        except Exception:
+            continue
+
+    log.info(
+        f"[DOWNLOAD_CAPTURE] template_id={template_id} files_detected={len(relevant)} "
+        f"files_moved={len(moved)} files_list={moved}"
+    )
+    return moved
+
+
 async def read_current_selection(tab, idx: int, slicer_title: str) -> dict:
     """
     Lê o estado atual do slicer diretamente do DOM:
@@ -6405,7 +6619,14 @@ def _display_slicers_inline(slicers: list):
     print("=" * 100)
 
 
-async def run_export(url: str, browser_path: str, target_page: str, stop_after_filters: bool = False):
+async def run_export(
+    url: str,
+    browser_path: str,
+    target_page: str,
+    stop_after_filters: bool = False,
+    filter_plan_override: dict | None = None,
+    auto_export_all: bool = False,
+):
     log.info("🚀 Iniciando automação Power BI")
     log.info(f"📎 URL: {url}")
     log.info(f"🌐 Navegador: {browser_path}")
@@ -6413,6 +6634,14 @@ async def run_export(url: str, browser_path: str, target_page: str, stop_after_f
         log.info(f"📄 Página alvo: {target_page}")
 
     browser_path = normalize_browser_path(browser_path)
+    global FILTER_PLAN
+    original_filter_plan = FILTER_PLAN
+    active_filter_plan = (
+        filter_plan_override
+        if isinstance(filter_plan_override, dict) and filter_plan_override
+        else FILTER_PLAN
+    )
+    FILTER_PLAN = active_filter_plan
 
     if not validate_runtime_config():
         return False
@@ -6605,7 +6834,11 @@ async def run_export(url: str, browser_path: str, target_page: str, stop_after_f
             log.warning("⚠️ Nenhum visual com 'Exportar dados' confirmado.")
             return False
 
-        selected_indexes = await ask_user_visual_selection(visuals)
+        if auto_export_all:
+            selected_indexes = exportable
+            log.info("📥 Modo batch/template: exportando automaticamente todos os visuais exportáveis.")
+        else:
+            selected_indexes = await ask_user_visual_selection(visuals)
         if not selected_indexes:
             log.warning("⛔ Exportação cancelada pelo usuário.")
             return False
@@ -6616,6 +6849,7 @@ async def run_export(url: str, browser_path: str, target_page: str, stop_after_f
         return True
 
     finally:
+        FILTER_PLAN = original_filter_plan
         await graceful_browser_shutdown(tab, browser)
 
 
@@ -6638,11 +6872,93 @@ async def graceful_browser_shutdown(tab, browser):
             await asyncio.sleep(0.2)
 
 
+async def run_export_batch(url: str, browser_path: str, default_target_page: str):
+    """
+    Executa lote de templates quando houver config, mantendo fallback legado.
+    """
+    catalog, templates = load_templates_config()
+    if not templates:
+        return await run_export(
+            url,
+            browser_path,
+            default_target_page,
+            stop_after_filters=True,
+        )
+
+    total = len(templates)
+    success = 0
+    failed = 0
+    skipped = 0
+    downloads_folder = get_downloads_folder()
+
+    for template in templates:
+        template_id = str(template.get("template_id") or "template_sem_id")
+        is_valid, errors, normalized_template = validate_template(template, catalog)
+        log.info(
+            f"[TEMPLATE_VALIDATE] template_id={template_id} valid={is_valid} errors={errors}"
+        )
+        if not is_valid:
+            failed += 1
+            continue
+
+        runtime_plan = build_runtime_filter_plan(normalized_template)
+        page = normalized_template.get("page") or default_target_page
+        template_code = build_template_code(normalized_template)
+        log.info(f"[TEMPLATE_CODE] template_id={template_id} template_code={template_code}")
+        output_folder = prepare_output_folder(template_id, template_code)
+        cleanup_residual_downloads(downloads_folder, template_id)
+
+        log.info(
+            f"[TEMPLATE_EXEC_START] template_id={template_id} page={page} "
+            f"filters={normalized_template.get('filters', {})}"
+        )
+        before_files = snapshot_downloads(downloads_folder)
+        error_msg = ""
+        export_ok = False
+        try:
+            export_ok = await run_export(
+                url=url,
+                browser_path=browser_path,
+                target_page=page,
+                stop_after_filters=True,
+                filter_plan_override=runtime_plan,
+                auto_export_all=True,
+            )
+        except Exception as exc:
+            error_msg = str(exc)
+            export_ok = False
+
+        moved_files = capture_and_move_new_downloads(
+            template_id=template_id,
+            downloads_folder=downloads_folder,
+            before_files=before_files,
+            output_folder=output_folder,
+        )
+
+        template_success = bool(export_ok)
+        if template_success:
+            success += 1
+        else:
+            failed += 1
+
+        log.info(
+            f"[TEMPLATE_EXEC_RESULT] template_id={template_id} success={template_success} "
+            f"export_ok={export_ok} output_folder={output_folder} error={error_msg}"
+        )
+        if not moved_files:
+            log.info(f"[TEMPLATE_EXEC_RESULT] template_id={template_id} moved_files=0")
+
+    log.info(
+        f"[BATCH_SUMMARY] total={total} success={success} failed={failed} skipped={skipped}"
+    )
+    return failed == 0 and success > 0
+
+
 def main():
     if not validate_runtime_config():
         sys.exit(1)
     try:
-        success = asyncio.run(run_export(POWERBI_URL, BROWSER_PATH, TARGET_PAGE, stop_after_filters=True))
+        success = asyncio.run(run_export_batch(POWERBI_URL, BROWSER_PATH, TARGET_PAGE))
         sys.exit(0 if success else 1)
     except KeyboardInterrupt:
         log.warning("⛔ Execução interrompida pelo usuário")
