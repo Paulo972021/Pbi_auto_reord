@@ -110,6 +110,10 @@ MORE_OPTIONS_RETRIES = 5
 
 # Número de tentativas para confirmar que um visual suporta exportação.
 EXPORT_PROBE_RETRIES = 3
+CRITICAL_OP_TIMEOUT_S = 3.0
+ACTIVATION_ATTEMPT_TIMEOUT_S = 4.0
+SLICER_STAGE_BUDGET_MS = 30000
+VISUAL_PROBE_STAGE_BUDGET_MS = 20000
 
 
     # ╔══════════════════════════════════════════════════════════════╗
@@ -191,6 +195,68 @@ def validate_runtime_config():
 def normalize_browser_path(path: str) -> str:
     """Normaliza o caminho do executável do navegador."""
     return os.path.abspath(os.path.expanduser(path.strip()))
+
+
+def _now_ms() -> int:
+    return int(asyncio.get_running_loop().time() * 1000)
+
+
+async def run_with_watchdog(awaitable, stage: str, timeout_s: float) -> dict:
+    """Executa awaitable com timeout duro + logs padronizados de watchdog."""
+    start_ms = _now_ms()
+    log.info(f"[STEP_WATCHDOG_START] stage={stage} timeout_s={timeout_s}")
+    try:
+        result = await asyncio.wait_for(awaitable, timeout=timeout_s)
+        end_ms = _now_ms()
+        log.info(
+            f"[STEP_WATCHDOG_END] stage={stage} duration_ms={end_ms - start_ms} "
+            f"ok=True timed_out=False"
+        )
+        return {"ok": True, "timed_out": False, "result": result, "error": None, "duration_ms": end_ms - start_ms}
+    except asyncio.TimeoutError:
+        end_ms = _now_ms()
+        log.warning(
+            f"[STEP_WATCHDOG_END] stage={stage} duration_ms={end_ms - start_ms} "
+            f"ok=False timed_out=True"
+        )
+        return {"ok": False, "timed_out": True, "result": None, "error": "timeout", "duration_ms": end_ms - start_ms}
+    except Exception as exc:
+        end_ms = _now_ms()
+        log.warning(
+            f"[STEP_WATCHDOG_END] stage={stage} duration_ms={end_ms - start_ms} "
+            f"ok=False timed_out=False"
+        )
+        return {"ok": False, "timed_out": False, "result": None, "error": str(exc), "duration_ms": end_ms - start_ms}
+
+
+async def guarded_evaluate(tab, script: str, stage_label: str, timeout_s: float = CRITICAL_OP_TIMEOUT_S) -> dict:
+    watched = await run_with_watchdog(tab.evaluate(script), stage=stage_label, timeout_s=timeout_s)
+    if watched["timed_out"]:
+        log.warning(
+            f"[BACKGROUND_HANG_SUSPECTED] stage={stage_label} "
+            f"reason=evaluate_timeout operation=tab.evaluate"
+        )
+    elif not watched["ok"]:
+        log.warning(
+            f"[TECHNICAL_STAGE_FAILURE] stage={stage_label} "
+            f"reason={watched.get('error')} functional_failure=False"
+        )
+    return watched
+
+
+async def guarded_cdp_click(tab, x: int, y: int, stage_label: str, timeout_s: float = CRITICAL_OP_TIMEOUT_S) -> dict:
+    watched = await run_with_watchdog(_cdp_click(tab, x, y), stage=stage_label, timeout_s=timeout_s)
+    if watched["timed_out"]:
+        log.warning(
+            f"[BACKGROUND_HANG_SUSPECTED] stage={stage_label} "
+            f"reason=cdp_click_timeout operation=cdp_click"
+        )
+    elif not watched["ok"]:
+        log.warning(
+            f"[TECHNICAL_STAGE_FAILURE] stage={stage_label} "
+            f"reason={watched.get('error')} functional_failure=False"
+        )
+    return watched
 
 def build_browser_args():
     """
@@ -1458,6 +1524,7 @@ async def open_more_options_robust(tab, visual, attempt: int, retries: int) -> d
     phase = "visual_export_probe"
     technical_error = None
     focus_fallback_used = False
+    stage_start_ms = _now_ms()
 
     log.info(f"    🎯 [{attempt}/{retries}] Abrindo 'Mais opções' em {title} (container #{idx})")
 
@@ -1471,7 +1538,9 @@ async def open_more_options_robust(tab, visual, attempt: int, retries: int) -> d
         nonlocal technical_error
         header_state = await get_visual_header_state(tab, visual)
         try:
-            result_raw = await tab.evaluate(f"""
+            eval_click = await guarded_evaluate(
+                tab,
+                f"""
                 (() => {{
                     const vc = Array.from(document.querySelectorAll('visual-container'))[{idx}];
                     if (!vc) return JSON.stringify({{ok: false, reason: 'no_vc'}});
@@ -1509,7 +1578,15 @@ async def open_more_options_robust(tab, visual, attempt: int, retries: int) -> d
                         total: btns.length
                     }});
                 }})()
-            """)
+            """,
+                stage_label=f"export_probe_visual_{idx}_attempt_{attempt}_click_eval",
+                timeout_s=CRITICAL_OP_TIMEOUT_S,
+            )
+            result_raw = eval_click.get("result")
+            if eval_click.get("timed_out"):
+                technical_error = "evaluate_timeout"
+            elif not eval_click.get("ok"):
+                technical_error = str(eval_click.get("error") or "transport_stall")
         except Exception as exc:
             technical_error = str(exc)
             log.warning(
@@ -1535,7 +1612,18 @@ async def open_more_options_robust(tab, visual, attempt: int, retries: int) -> d
         if result.get("ok"):
             for check in range(6):
                 await asyncio.sleep(0.4)
-                if await is_visual_menu_open(tab):
+                menu_watch = await run_with_watchdog(
+                    is_visual_menu_open(tab),
+                    stage=f"export_probe_visual_{idx}_menu_check_{check + 1}",
+                    timeout_s=CRITICAL_OP_TIMEOUT_S,
+                )
+                if menu_watch.get("timed_out"):
+                    technical_error = "post_action_state_timeout"
+                    log.warning(
+                        f"[BACKGROUND_HANG_SUSPECTED] stage=export_probe_visual_{idx} "
+                        f"reason=post_action_state_timeout operation=post_menu_visibility_check"
+                    )
+                if bool(menu_watch.get("ok") and menu_watch.get("result")):
                     menu_opened = True
                     log.info(f"      ✅ menu aberto (check {check + 1})")
                     break
@@ -1565,14 +1653,17 @@ async def open_more_options_robust(tab, visual, attempt: int, retries: int) -> d
     reason = str(initial.get("reason") or "unknown")
     log.warning(f"[EXPORT_PROBE_FAILURE] visual_index={idx} title={title} reason={reason} attempt={attempt}")
     needs_focus_fallback = reason in {
-        "no_buttons_rendered",
-        "header_hidden",
-        "target_button_not_visible",
+        "js_transport_error",
         "click_executed_menu_not_opened",
         "background_visibility_suspected",
+        "post_action_state_timeout",
     }
     if needs_focus_fallback:
         focus_fallback_used = True
+        log.warning(
+            f"[FALLBACK_AFTER_HANG] stage=visual_export_probe_{idx} "
+            f"reason={reason} retry_with_focus=True"
+        )
         log.warning(
             f"[EXPORT_FOCUS_FALLBACK_USED] visual_index={idx} title={title} "
             f"reason=background_visibility_suspected"
@@ -1588,6 +1679,19 @@ async def open_more_options_robust(tab, visual, attempt: int, retries: int) -> d
                 f"mode=dom_first_then_focus_fallback safe_focus_called=True reason=fallback_success"
             )
             return {"ok": True, "reason": "ok_after_focus_fallback", "focus_fallback_used": True}
+
+    elapsed_ms = _now_ms() - stage_start_ms
+    budget_exceeded = elapsed_ms > VISUAL_PROBE_STAGE_BUDGET_MS
+    log.info(
+        f"[VISUAL_STAGE_BUDGET] visual_index={idx} budget_ms={VISUAL_PROBE_STAGE_BUDGET_MS} "
+        f"elapsed_ms={elapsed_ms} budget_exceeded={budget_exceeded}"
+    )
+    if budget_exceeded:
+        log.warning(
+            f"[TECHNICAL_STAGE_FAILURE] stage=visual_export_probe_{idx} "
+            f"reason=budget_exceeded functional_failure=False"
+        )
+        reason = "background_resume_needed"
 
     log.info(
         f"[EXPORT_FOCUS_POLICY] visual_index={idx} phase={phase} "
@@ -1653,10 +1757,16 @@ async def try_open_visual_menu_and_confirm_export(tab, visual, retries=5):
         )
         open_result = await open_more_options_robust(tab, visual, attempt, retries)
         if not open_result.get("ok"):
+            reason = str(open_result.get("reason") or "unknown")
             log.warning(
                 f"[EXPORT_PROBE_FAILURE] visual_index={idx} title={title} "
-                f"reason={open_result.get('reason')} attempt={attempt}"
+                f"reason={reason} attempt={attempt}"
             )
+            if reason in {"js_transport_error", "background_resume_needed", "post_action_state_timeout"}:
+                log.warning(
+                    f"[TECHNICAL_STAGE_FAILURE] stage=visual_export_probe_{idx} "
+                    f"reason={reason} functional_failure=False"
+                )
             await asyncio.sleep(RETRY_MENU_WAIT)
             continue
 
@@ -1702,10 +1812,16 @@ async def probe_visual_export_status(tab, visual, retries=3):
         )
         open_result = await open_more_options_robust(tab, visual, attempt, retries)
         if not open_result.get("ok"):
+            reason = str(open_result.get("reason") or "unknown")
             log.warning(
                 f"[EXPORT_PROBE_FAILURE] visual_index={idx} title={title} "
-                f"reason={open_result.get('reason')} attempt={attempt}"
+                f"reason={reason} attempt={attempt}"
             )
+            if reason in {"js_transport_error", "background_resume_needed", "post_action_state_timeout"}:
+                log.warning(
+                    f"[TECHNICAL_STAGE_FAILURE] stage=visual_export_probe_{idx} "
+                    f"reason={reason} functional_failure=False"
+                )
             await asyncio.sleep(RETRY_MENU_WAIT)
             continue
 
@@ -2920,10 +3036,13 @@ async def _simple_keyboard_probe(tab) -> dict:
 
 async def _experiment_activate_slicer(tab, idx: int, slicer_title: str) -> dict:
     import json as _j
+    stage_budget_start_ms = _now_ms()
 
     async def _snapshot(label: str) -> dict:
         try:
-            raw = await tab.evaluate(f"""
+            read_state = await guarded_evaluate(
+                tab,
+                f"""
                 (() => {{
                     const vc = Array.from(document.querySelectorAll('visual-container'))[{idx}];
                     if (!vc) return JSON.stringify({{error: 'no_vc'}});
@@ -2946,9 +3065,24 @@ async def _experiment_activate_slicer(tab, idx: int, slicer_title: str) -> dict:
                         item_count: items.length,
                     }});
                 }})()
-            """)
+            """,
+                stage_label=f"activation_{label}_state_read",
+                timeout_s=CRITICAL_OP_TIMEOUT_S,
+            )
+            raw = read_state.get("result")
+            if not read_state.get("ok"):
+                return {"error": read_state.get("error"), "_label": label}
             data = _j.loads(str(raw)) if raw else {}
             data["_label"] = label
+            unknown_state = any(
+                data.get(k) in {None, "?", ""} for k in ("host_class", "vc_class", "ae_tag", "ae_in_slicer")
+            )
+            if unknown_state:
+                log.warning(
+                    f"[POST_ACTION_STATE_INVALID] stage=activation_{label}_post_read "
+                    f"host_class={data.get('host_class','?')} vc_class={data.get('vc_class','?')} "
+                    f"ae={data.get('ae_tag','?')} reason=incomplete_or_stalled_state_read"
+                )
             return data
         except Exception as e:
             return {"error": str(e), "_label": label}
@@ -3005,6 +3139,11 @@ async def _experiment_activate_slicer(tab, idx: int, slicer_title: str) -> dict:
     result = {"winner": None, "winner_target": None, "winner_coords": None, "evidence": {}}
 
     for letter, description, coords in experiments:
+        attempt_start_ms = _now_ms()
+        log.info(
+            f"[ACTIVATION_ATTEMPT_START] slicer={slicer_title} attempt={letter} "
+            f"timeout_s={ACTIVATION_ATTEMPT_TIMEOUT_S}"
+        )
         log.info(f"    🔹 Tentativa {letter} — {description} coords={coords}")
         await press_escape(tab, times=1, wait_each=0.2)
         await asyncio.sleep(0.3)
@@ -3023,7 +3162,9 @@ async def _experiment_activate_slicer(tab, idx: int, slicer_title: str) -> dict:
             continue
 
         try:
-            await tab.evaluate(f"""
+            hover_dispatch = await guarded_evaluate(
+                tab,
+                f"""
                 (() => {{
                     const vc = Array.from(document.querySelectorAll('visual-container'))[{idx}];
                     if (!vc) return;
@@ -3032,12 +3173,35 @@ async def _experiment_activate_slicer(tab, idx: int, slicer_title: str) -> dict:
                         vc.dispatchEvent(new PointerEvent(t, init))
                     );
                 }})()
-            """)
+            """,
+                stage_label=f"activation_{letter}_hover_dispatch",
+                timeout_s=CRITICAL_OP_TIMEOUT_S,
+            )
+            if hover_dispatch.get("timed_out"):
+                log.warning(
+                    f"[BACKGROUND_HANG_SUSPECTED] stage=activation_{letter} "
+                    f"reason=evaluate_timeout operation=hover_dispatch"
+                )
         except Exception:
             pass
         await asyncio.sleep(0.5)
 
-        clicked = await _cdp_click(tab, cx, cy)
+        click_watch = await guarded_cdp_click(
+            tab, cx, cy, stage_label=f"activation_{letter}_cdp_click", timeout_s=CRITICAL_OP_TIMEOUT_S
+        )
+        if click_watch.get("timed_out") or not click_watch.get("ok"):
+            reason = "cdp_click_timeout" if click_watch.get("timed_out") else "transport_stall"
+            log.warning(
+                f"[FALLBACK_AFTER_HANG] stage=activation_{letter} "
+                f"reason={reason} retry_with_focus=True"
+            )
+            await safe_focus_tab(tab)
+            retry_click_watch = await guarded_cdp_click(
+                tab, cx, cy, stage_label=f"activation_{letter}_cdp_click_focus_retry", timeout_s=CRITICAL_OP_TIMEOUT_S
+            )
+            if retry_click_watch.get("ok"):
+                click_watch = retry_click_watch
+        clicked = bool(click_watch.get("ok") and click_watch.get("result"))
         log.info(f"    [CLICK {letter}] cdp_click={clicked} coords=({cx},{cy})")
         await asyncio.sleep(1.2)
 
@@ -3059,11 +3223,31 @@ async def _experiment_activate_slicer(tab, idx: int, slicer_title: str) -> dict:
             "before": before, "after": after,
         }
 
+        attempt_duration_ms = _now_ms() - attempt_start_ms
+        timed_out = bool(click_watch.get("timed_out"))
+        log.info(
+            f"[ACTIVATION_ATTEMPT_END] slicer={slicer_title} attempt={letter} "
+            f"ok={activated} timed_out={timed_out} duration_ms={attempt_duration_ms}"
+        )
+
         if activated and result["winner"] is None:
             result["winner"] = letter
             result["winner_target"] = description
             result["winner_coords"] = coords
             log.info(f"    🏆 Tentativa {letter} é o VENCEDOR para este slicer")
+
+        elapsed_ms = _now_ms() - stage_budget_start_ms
+        budget_exceeded = elapsed_ms > SLICER_STAGE_BUDGET_MS
+        log.info(
+            f"[SLICER_STAGE_BUDGET] slicer={slicer_title} budget_ms={SLICER_STAGE_BUDGET_MS} "
+            f"elapsed_ms={elapsed_ms} budget_exceeded={budget_exceeded}"
+        )
+        if budget_exceeded:
+            log.warning(
+                f"[TECHNICAL_STAGE_FAILURE] stage=slicer_activation_budget "
+                f"reason=budget_exceeded functional_failure=False"
+            )
+            break
 
     if result["winner"]:
         log.info(f"  ✅ Experimento concluído: vencedor={result['winner']} ({result['winner_target']})")
