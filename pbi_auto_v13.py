@@ -3099,6 +3099,17 @@ async def _experiment_activate_slicer(tab, idx: int, slicer_title: str) -> dict:
         items_grew = (after.get("item_count", 0) or 0) > (before.get("item_count", 0) or 0)
         return any([host_changed, focus_gained, inp_appeared, lb_appeared, items_grew])
 
+    def _post_state_valid(state: dict) -> bool:
+        if not isinstance(state, dict):
+            return False
+        required_keys = ("host_class", "vc_class", "ae_tag", "ae_in_slicer", "item_count")
+        for key in required_keys:
+            if state.get(key) in {None, "?", ""}:
+                return False
+        if not isinstance(state.get("ae_in_slicer"), bool):
+            return False
+        return True
+
     async def _get_targets() -> dict:
         try:
             raw = await tab.evaluate(f"""
@@ -3209,9 +3220,31 @@ async def _experiment_activate_slicer(tab, idx: int, slicer_title: str) -> dict:
         log.info(f"    DEPOIS [{letter}]:")
         await _log_snapshot(after)
 
-        activated = _is_activated(before, after)
+        activated_signal = _is_activated(before, after)
+        post_state_valid = _post_state_valid(after)
+        click_timed_out = bool(click_watch.get("timed_out"))
+        readback_timed_out = bool(after.get("error") == "timeout")
+        in_slicer_value = after.get("ae_in_slicer") if post_state_valid else None
+        attempt_ok = bool(
+            clicked
+            and not click_timed_out
+            and not readback_timed_out
+            and post_state_valid
+            and in_slicer_value is True
+            and activated_signal
+        )
+        if not post_state_valid:
+            log.warning(
+                f"[ACTIVATION_INVALID_STATE] attempt={letter} reason=incomplete_post_action_state"
+            )
         log.info(
-            f"    {'✅ ATIVADO' if activated else '❌ sem mudança'} [{letter}] "
+            f"[ACTIVATION_ATTEMPT_RESULT] attempt={letter} "
+            f"cdp_click={clicked} click_timed_out={click_timed_out} "
+            f"readback_timed_out={readback_timed_out} post_state_valid={post_state_valid} "
+            f"in_slicer={in_slicer_value} ok={attempt_ok}"
+        )
+        log.info(
+            f"    {'✅ ATIVADO' if attempt_ok else '❌ sem mudança'} [{letter}] "
             f"host_changed={before.get('host_class') != after.get('host_class')} "
             f"focus_gained={after.get('ae_in_slicer')} "
             f"inp_appeared={after.get('inp_visible') and not before.get('inp_visible')} "
@@ -3219,7 +3252,10 @@ async def _experiment_activate_slicer(tab, idx: int, slicer_title: str) -> dict:
         )
 
         result["evidence"][letter] = {
-            "coords": coords, "clicked": clicked, "activated": activated,
+            "coords": coords, "clicked": clicked, "activated": attempt_ok,
+            "click_timed_out": click_timed_out,
+            "readback_timed_out": readback_timed_out,
+            "post_state_valid": post_state_valid,
             "before": before, "after": after,
         }
 
@@ -3227,14 +3263,33 @@ async def _experiment_activate_slicer(tab, idx: int, slicer_title: str) -> dict:
         timed_out = bool(click_watch.get("timed_out"))
         log.info(
             f"[ACTIVATION_ATTEMPT_END] slicer={slicer_title} attempt={letter} "
-            f"ok={activated} timed_out={timed_out} duration_ms={attempt_duration_ms}"
+            f"ok={attempt_ok} timed_out={timed_out} duration_ms={attempt_duration_ms}"
         )
 
-        if activated and result["winner"] is None:
+        eligible = bool(attempt_ok and not timed_out and post_state_valid and in_slicer_value is True)
+        if eligible and result["winner"] is None:
             result["winner"] = letter
             result["winner_target"] = description
             result["winner_coords"] = coords
             log.info(f"    🏆 Tentativa {letter} é o VENCEDOR para este slicer")
+        else:
+            reason_parts = []
+            if not clicked:
+                reason_parts.append("click_not_confirmed")
+            if click_timed_out:
+                reason_parts.append("click_timeout")
+            if readback_timed_out:
+                reason_parts.append("readback_timeout")
+            if not post_state_valid:
+                reason_parts.append("invalid_post_state")
+            if in_slicer_value is not True:
+                reason_parts.append("in_slicer_not_confirmed")
+            if not activated_signal:
+                reason_parts.append("no_activation_signal")
+            reason = "_and_".join(reason_parts) if reason_parts else "not_eligible"
+            log.info(
+                f"[ACTIVATION_WINNER_DECISION] attempt={letter} eligible={eligible} reason={reason}"
+            )
 
         elapsed_ms = _now_ms() - stage_budget_start_ms
         budget_exceeded = elapsed_ms > SLICER_STAGE_BUDGET_MS
