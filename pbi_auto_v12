@@ -1242,6 +1242,110 @@ async def visual_menu_has_export_option(tab) -> bool:
 
     return False
 
+async def get_visual_header_state(tab, visual) -> dict:
+    """Diagnóstico do header/botão de opções para probe de exportação."""
+    idx = visual.get("index")
+    title = visual.get("title", f"Visual #{idx}")
+    page_visibility = await get_page_focus_state(tab, stage_label=f"export_probe_visual_{idx}")
+    log.info(
+        f"[EXPORT_PAGE_VISIBILITY] visual_index={idx} "
+        f"hidden={page_visibility.get('hidden')} "
+        f"visibilityState={page_visibility.get('visibilityState')} "
+        f"hasFocus={page_visibility.get('hasFocus')}"
+    )
+
+    try:
+        raw = await tab.evaluate(f"""
+            (() => {{
+                const vcs = Array.from(document.querySelectorAll('visual-container'));
+                const vc = vcs[{idx}];
+                if (!vc) {{
+                    return JSON.stringify({{
+                        ok: false,
+                        header_visible: false,
+                        buttons_found: 0,
+                        target_button_visible: false,
+                        target_button_enabled: false,
+                        visual_rendered: false,
+                    }});
+                }}
+                const isVisible = (el) => {{
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 1 && r.height > 1;
+                }};
+                const vcRect = vc.getBoundingClientRect();
+                const visual_rendered = vcRect.width > 10 && vcRect.height > 10;
+                const header = vc.querySelector('visual-container-header, .visualContainerHeader, [class*="header"]');
+                const header_visible = isVisible(header);
+                let buttons = Array.from(vc.querySelectorAll('button')).filter((b) => {{
+                    const r = b.getBoundingClientRect();
+                    return r.width > 1 && r.height > 1 && r.top >= vcRect.top && r.top <= vcRect.top + 56;
+                }});
+                if (!buttons.length) {{
+                    buttons = Array.from(vc.querySelectorAll('button')).filter(isVisible);
+                }}
+                buttons.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+                const target = buttons.length ? buttons[0] : null;
+                return JSON.stringify({{
+                    ok: true,
+                    header_visible,
+                    buttons_found: buttons.length,
+                    target_button_visible: isVisible(target),
+                    target_button_enabled: target ? !target.disabled : false,
+                    visual_rendered,
+                }});
+            }})()
+        """)
+        parsed = json.loads(str(raw)) if raw else {}
+    except Exception:
+        parsed = {}
+
+    parsed = parsed if isinstance(parsed, dict) else {}
+    result = {
+        "ok": bool(parsed.get("ok")),
+        "header_visible": bool(parsed.get("header_visible")),
+        "buttons_found": int(parsed.get("buttons_found") or 0),
+        "target_button_visible": bool(parsed.get("target_button_visible")),
+        "target_button_enabled": bool(parsed.get("target_button_enabled")),
+        "visual_rendered": bool(parsed.get("visual_rendered")),
+    }
+    background_suspected = bool(
+        page_visibility.get("hidden") is True
+        or str(page_visibility.get("visibilityState") or "").lower() != "visible"
+        or page_visibility.get("hasFocus") is False
+        or result["buttons_found"] == 0
+        or not result["header_visible"]
+    )
+    result["background_suspected"] = background_suspected
+    log.info(
+        f"[VISUAL_HEADER_STATE] visual_index={idx} title={title} "
+        f"header_visible={result['header_visible']} buttons_found={result['buttons_found']} "
+        f"target_button_visible={result['target_button_visible']} "
+        f"target_button_enabled={result['target_button_enabled']} "
+        f"background_suspected={result['background_suspected']}"
+    )
+    return result
+
+
+def classify_export_probe_failure(header_state: dict, click_reason: str, menu_opened: bool, technical_error: str | None) -> str:
+    """Classifica falha de probe/exportação com motivo concreto."""
+    if technical_error:
+        return "js_transport_error"
+    if menu_opened:
+        return "click_executed_menu_not_opened"
+    if (header_state or {}).get("buttons_found", 0) == 0:
+        return "no_buttons_rendered"
+    if not (header_state or {}).get("header_visible", False):
+        return "header_hidden"
+    if not (header_state or {}).get("target_button_visible", False):
+        return "target_button_not_visible"
+    if (header_state or {}).get("background_suspected"):
+        return "background_visibility_suspected"
+    if click_reason == "menu_not_opened":
+        return "click_executed_menu_not_opened"
+    return "background_visibility_suspected"
+
 async def locate_more_options_button(tab, visual):
     """
     Localiza o ÚLTIMO botão do header (rightmost = Mais opções).
@@ -1344,12 +1448,16 @@ async def is_visual_menu_open(tab) -> bool:
         return False
 
 
-async def open_more_options_robust(tab, visual, attempt: int, retries: int) -> bool:
+async def open_more_options_robust(tab, visual, attempt: int, retries: int) -> dict:
     """
-    Abre 'Mais opções' (botão mais à direita do header) via JS com JSON.stringify.
+    Abre 'Mais opções' com diagnóstico robusto para background na fase de exportação.
+    Retorna dict com status, motivo e se precisou fallback de foco.
     """
-    idx   = visual.get("index")
+    idx = visual.get("index")
     title = visual.get("title", f"Visual #{idx}")
+    phase = "visual_export_probe"
+    technical_error = None
+    focus_fallback_used = False
 
     log.info(f"    🎯 [{attempt}/{retries}] Abrindo 'Mais opções' em {title} (container #{idx})")
 
@@ -1359,95 +1467,133 @@ async def open_more_options_robust(tab, visual, attempt: int, retries: int) -> b
     await force_hover_visual_header(tab, visual)
     await asyncio.sleep(0.8)
 
-    try:
-        result_raw = await tab.evaluate(f"""
-            (() => {{
-                const vc = Array.from(document.querySelectorAll('visual-container'))[{idx}];
-                if (!vc) return JSON.stringify({{ok: false, reason: 'no_vc'}});
-
-                const vcRect = vc.getBoundingClientRect();
-                const hx = vcRect.left + vcRect.width - 20;
-                const hy = vcRect.top + 16;
-                ['pointerenter','pointerover','mouseenter','mouseover','mousemove','pointermove'].forEach(t => {{
-                    vc.dispatchEvent(new PointerEvent(t, {{
-                        bubbles: true, composed: true, view: window,
-                        clientX: hx, clientY: hy
-                    }}));
-                }});
-
-                // Botões do header (primeiros 50px verticais)
-                let btns = Array.from(vc.querySelectorAll('button')).filter(b => {{
-                    const r = b.getBoundingClientRect();
-                    return r.width > 1 && r.height > 1 &&
-                           r.top >= vcRect.top && r.top <= vcRect.top + 50;
-                }});
-
-                // Sem filtro de altura se vazio
-                if (btns.length === 0) {{
-                    btns = Array.from(vc.querySelectorAll('button')).filter(b => {{
-                        const r = b.getBoundingClientRect();
-                        return r.width > 1 && r.height > 1;
-                    }});
-                }}
-                if (btns.length === 0) return JSON.stringify({{ok: false, reason: 'no_buttons'}});
-
-                // Mais opções = botão mais à direita
-                btns.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
-                const btn = btns[0];
-                const r = btn.getBoundingClientRect();
-                btn.dispatchEvent(new MouseEvent('mouseover', {{bubbles: true}}));
-                btn.click();
-                return JSON.stringify({{
-                    ok: true,
-                    reason: 'rightmost_btn',
-                    x: Math.round(r.left + r.width / 2),
-                    y: Math.round(r.top + r.height / 2),
-                    w: Math.round(r.width),
-                    h: Math.round(r.height),
-                    total: btns.length
-                }});
-            }})()
-        """)
-    except Exception as e:
-        result_raw = None
-        log.info(f"      ⚠️ JS exception: {e}")
-
-    # Normaliza resultado — nodriver pode retornar str, dict, list ou None
-    import json as _json
-    result = {"ok": False, "reason": "not_set"}
-    if result_raw is None:
-        result = {"ok": False, "reason": "js_none"}
-    elif isinstance(result_raw, str):
+    async def _attempt_click_once():
+        nonlocal technical_error
+        header_state = await get_visual_header_state(tab, visual)
         try:
-            result = _json.loads(result_raw)
-        except Exception:
-            result = {"ok": False, "reason": f"parse_err:{result_raw[:60]}"}
-    elif isinstance(result_raw, dict):
-        result = result_raw
-    else:
-        result = {"ok": False, "reason": f"type:{type(result_raw).__name__}:{str(result_raw)[:80]}"}
+            result_raw = await tab.evaluate(f"""
+                (() => {{
+                    const vc = Array.from(document.querySelectorAll('visual-container'))[{idx}];
+                    if (!vc) return JSON.stringify({{ok: false, reason: 'no_vc'}});
+                    const vcRect = vc.getBoundingClientRect();
+                    const hx = vcRect.left + vcRect.width - 20;
+                    const hy = vcRect.top + 16;
+                    ['pointerenter','pointerover','mouseenter','mouseover','mousemove','pointermove'].forEach(t => {{
+                        vc.dispatchEvent(new PointerEvent(t, {{
+                            bubbles: true, composed: true, view: window, clientX: hx, clientY: hy
+                        }}));
+                    }});
+                    let btns = Array.from(vc.querySelectorAll('button')).filter(b => {{
+                        const r = b.getBoundingClientRect();
+                        return r.width > 1 && r.height > 1 && r.top >= vcRect.top && r.top <= vcRect.top + 50;
+                    }});
+                    if (btns.length === 0) {{
+                        btns = Array.from(vc.querySelectorAll('button')).filter(b => {{
+                            const r = b.getBoundingClientRect();
+                            return r.width > 1 && r.height > 1;
+                        }});
+                    }}
+                    if (btns.length === 0) return JSON.stringify({{ok: false, reason: 'no_buttons'}});
+                    btns.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+                    const btn = btns[0];
+                    const r = btn.getBoundingClientRect();
+                    btn.dispatchEvent(new MouseEvent('mouseover', {{bubbles: true}}));
+                    btn.click();
+                    return JSON.stringify({{
+                        ok: true,
+                        reason: 'rightmost_btn',
+                        x: Math.round(r.left + r.width / 2),
+                        y: Math.round(r.top + r.height / 2),
+                        w: Math.round(r.width),
+                        h: Math.round(r.height),
+                        total: btns.length
+                    }});
+                }})()
+            """)
+        except Exception as exc:
+            technical_error = str(exc)
+            log.warning(
+                f"[EXPORT_TECHNICAL_INCIDENT] visual_index={idx} title={title} "
+                f"error={technical_error} retry_allowed={attempt < retries}"
+            )
+            result_raw = None
 
-    if not result.get("ok"):
-        log.info(f"      ⚠️ JS não clicou: {result.get('reason')}")
-        log.info(f"      ❌ tentativa {attempt}/{retries} sem sucesso para abrir 'Mais opções'")
-        return False
+        result = {"ok": False, "reason": "not_set"}
+        if result_raw is None:
+            result = {"ok": False, "reason": "js_none"}
+        elif isinstance(result_raw, str):
+            try:
+                result = json.loads(result_raw)
+            except Exception:
+                result = {"ok": False, "reason": f"parse_err:{str(result_raw)[:60]}"}
+        elif isinstance(result_raw, dict):
+            result = result_raw
+        else:
+            result = {"ok": False, "reason": f"type:{type(result_raw).__name__}"}
+
+        menu_opened = False
+        if result.get("ok"):
+            for check in range(6):
+                await asyncio.sleep(0.4)
+                if await is_visual_menu_open(tab):
+                    menu_opened = True
+                    log.info(f"      ✅ menu aberto (check {check + 1})")
+                    break
+        failure_reason = classify_export_probe_failure(
+            header_state=header_state,
+            click_reason=result.get("reason", ""),
+            menu_opened=menu_opened,
+            technical_error=technical_error,
+        )
+        return {
+            "ok": bool(result.get("ok") and menu_opened),
+            "clicked": bool(result.get("ok")),
+            "menu_opened": menu_opened,
+            "reason": "ok" if result.get("ok") and menu_opened else failure_reason,
+            "js_reason": result.get("reason"),
+            "header_state": header_state,
+        }
+
+    initial = await _attempt_click_once()
+    if initial.get("ok"):
+        log.info(
+            f"[EXPORT_FOCUS_POLICY] visual_index={idx} phase={phase} "
+            f"mode=dom_first_then_focus_fallback safe_focus_called=False reason=ok"
+        )
+        return {"ok": True, "reason": "ok", "focus_fallback_used": False}
+
+    reason = str(initial.get("reason") or "unknown")
+    log.warning(f"[EXPORT_PROBE_FAILURE] visual_index={idx} title={title} reason={reason} attempt={attempt}")
+    needs_focus_fallback = reason in {
+        "no_buttons_rendered",
+        "header_hidden",
+        "target_button_not_visible",
+        "click_executed_menu_not_opened",
+        "background_visibility_suspected",
+    }
+    if needs_focus_fallback:
+        focus_fallback_used = True
+        log.warning(
+            f"[EXPORT_FOCUS_FALLBACK_USED] visual_index={idx} title={title} "
+            f"reason=background_visibility_suspected"
+        )
+        await safe_focus_tab(tab)
+        await asyncio.sleep(0.6)
+        await force_hover_visual_header(tab, visual)
+        second = await _attempt_click_once()
+        reason = str(second.get("reason") or reason)
+        if second.get("ok"):
+            log.info(
+                f"[EXPORT_FOCUS_POLICY] visual_index={idx} phase={phase} "
+                f"mode=dom_first_then_focus_fallback safe_focus_called=True reason=fallback_success"
+            )
+            return {"ok": True, "reason": "ok_after_focus_fallback", "focus_fallback_used": True}
 
     log.info(
-        f"      • clicado: x={result.get('x')} y={result.get('y')} "
-        f"(w={result.get('w')} h={result.get('h')}) "
-        f"[{result.get('reason')}] total_btns={result.get('total')}"
+        f"[EXPORT_FOCUS_POLICY] visual_index={idx} phase={phase} "
+        f"mode=dom_first_then_focus_fallback safe_focus_called={focus_fallback_used} reason={reason}"
     )
-
-    # Verifica múltiplas vezes se o menu apareceu
-    for check in range(6):
-        await asyncio.sleep(0.4)
-        if await is_visual_menu_open(tab):
-            log.info(f"      ✅ menu aberto (check {check + 1})")
-            return True
-
-    log.info("      ⚠️ clique JS executou mas menu não ficou visível")
-    log.info(f"      ❌ tentativa {attempt}/{retries} sem sucesso para abrir 'Mais opções'")
-    return False
+    return {"ok": False, "reason": reason, "focus_fallback_used": focus_fallback_used}
 
 
 async def force_hover_visual_header(tab, visual):
@@ -1505,8 +1651,12 @@ async def try_open_visual_menu_and_confirm_export(tab, visual, retries=5):
             stage_label=f"antes de abrir 'Mais opções' (visual #{idx})",
             aggressive=True,
         )
-        clicked = await open_more_options_robust(tab, visual, attempt, retries)
-        if not clicked:
+        open_result = await open_more_options_robust(tab, visual, attempt, retries)
+        if not open_result.get("ok"):
+            log.warning(
+                f"[EXPORT_PROBE_FAILURE] visual_index={idx} title={title} "
+                f"reason={open_result.get('reason')} attempt={attempt}"
+            )
             await asyncio.sleep(RETRY_MENU_WAIT)
             continue
 
@@ -1542,6 +1692,7 @@ async def probe_visual_export_status(tab, visual, retries=3):
     - menu abriu com exportação
     """
     idx = visual.get("index")
+    title = visual.get("title", f"Visual #{idx}")
 
     for attempt in range(1, retries + 1):
         await cleanup_residual_ui(
@@ -1549,8 +1700,12 @@ async def probe_visual_export_status(tab, visual, retries=3):
             stage_label=f"probe de exportação - visual #{idx} tentativa {attempt}",
             aggressive=True,
         )
-        clicked = await open_more_options_robust(tab, visual, attempt, retries)
-        if not clicked:
+        open_result = await open_more_options_robust(tab, visual, attempt, retries)
+        if not open_result.get("ok"):
+            log.warning(
+                f"[EXPORT_PROBE_FAILURE] visual_index={idx} title={title} "
+                f"reason={open_result.get('reason')} attempt={attempt}"
+            )
             await asyncio.sleep(RETRY_MENU_WAIT)
             continue
 
@@ -1581,17 +1736,20 @@ async def probe_visual_export_status(tab, visual, retries=3):
                 "menu_opened": True,
                 "has_export": True,
                 "reason": "menu_visual_com_exportacao",
+                "focus_fallback_used": bool(open_result.get("focus_fallback_used")),
             }
         return {
             "menu_opened": True,
             "has_export": False,
             "reason": "menu_visual_sem_exportacao",
+            "focus_fallback_used": bool(open_result.get("focus_fallback_used")),
         }
 
     return {
         "menu_opened": False,
         "has_export": False,
         "reason": "menu_nao_abriu",
+        "focus_fallback_used": False,
     }
 
 
@@ -1808,6 +1966,10 @@ async def scan_visuals(tab, slicer_indexes: set = None):
     log.info(f"📊 Total de visual-containers válidos: {len(exportable)}")
     log.info(f"📋 Visuais com header de opções: {sum(1 for v in exportable if v.get('hasOptionsButton'))}")
     log.info("🔬 Verificando quais visuais suportam 'Exportar dados'...")
+    confirmed_exportable = []
+    confirmed_non_exportable = []
+    technical_failures = []
+    focus_fallback_needed = []
 
     NAV_TITLE_FRAGMENTS = (
         "pressionar enter para explorar",
@@ -1841,10 +2003,26 @@ async def scan_visuals(tab, slicer_indexes: set = None):
         visual["menuOpened"]    = bool(probe.get("menu_opened"))
         visual["hasExportData"] = bool(probe.get("has_export"))
         visual["exportReason"]  = str(probe.get("reason") or "indefinido")
+        visual["focusFallbackUsed"] = bool(probe.get("focus_fallback_used"))
+
+        if visual["focusFallbackUsed"]:
+            focus_fallback_needed.append(container_idx)
+        if visual["hasExportData"]:
+            confirmed_exportable.append(container_idx)
+        elif visual["exportReason"] in {"js_transport_error"}:
+            technical_failures.append(container_idx)
+        else:
+            confirmed_non_exportable.append(container_idx)
 
         await close_open_menus_and_overlays(tab, aggressive=True)
         await asyncio.sleep(0.5)
 
+    log.info(
+        f"[EXPORT_PROBE_SUMMARY] confirmed_exportable={confirmed_exportable} "
+        f"confirmed_non_exportable={confirmed_non_exportable} "
+        f"technical_failures={technical_failures} "
+        f"focus_fallback_needed={focus_fallback_needed}"
+    )
     log.info(f"✅ {sum(1 for v in exportable if v.get('hasExportData'))} visuais com 'Exportar dados' confirmado")
     return exportable
 
